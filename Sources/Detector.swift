@@ -1,45 +1,34 @@
 //
-//  Detector.swift
+//  Detector.swift  v4
 //
 //  Attempts to observe a lost SPTM stage-2 (UAT) TLBI from an unprivileged app.
 //
-//  EXPERIMENTAL DESIGN
+//  DESIGN
 //    positive control : deliberate foreign write, proves the checker can fire
-//    control phase    : no churn at all, proves the checker does not fire spuriously
-//    churn phase      : the actual attempt
+//    control phase    : no churn, proves the checker does not fire spuriously
+//    grow phase       : hold a large arena so the pool sits past any pre-mapped
+//                       region and new buffers must create real mappings
+//    churn phase      : one of three strategies, selectable
 //
-//  CAN establish:
-//    - a GPU write landing in a page the CPU is not looking at, unambiguously,
-//      via a CPU sentinel the GPU never writes
-//    - that the checker works at all (positive control)
-//    - its own false-positive rate (control phase)
-//    - whether the allocator recycles GPU virtual addresses, via
-//      MTLResource.gpuAddress -- the only part of the premise that is observable
+//  STRATEGIES
+//    fragment : free an alternating subset of a contiguous VA window. Partial,
+//               unaligned unmaps are the shape the writeup names
+//               (DART_UNGANG_GAPF_RACE) -- a whole-run unmap gets ganged and
+//               never races.
+//    purge    : purge -> thief -> unpurge. Tears down and rebuilds a mapping on
+//               a stable VA, so a stale entry is directly observable with no
+//               reliance on the allocator recycling anything.
+//    recycle  : random slot recycle (v3 behaviour), kept for comparison.
 //
-//  CANNOT establish:
-//    - whether Metal buffer map/unmap reaches the SPTM UAT mutation path.
-//      If AGX sub-allocates inside a pre-mapped heap there is no per-buffer
-//      stage-2 edit and this can never fire. Settling it needs kernel
-//      instrumentation or an SRD, not an app.
-//
-//  Corpus (writeup section 1): SPTM-820.40.18 ships in 24A446 (27.0.1) and
-//  24B5084k (27.2b1) and is buggy; fix is SPTM-820.40.23 in 24B5099f.
-//
-//  A hit requires ALL of: (a) a GPU VA is recycled, (b) the unmap or remap
-//  loses its TLBI, (c) the GPU touches the VA before anything corrects it.
-//  Only (a) is measurable here. Note the writeup's 8.33 ms is the gate spin
-//  timeout, NOT the race window -- the window is instruction-scale.
+//  CANNOT establish: whether any of this reaches the SPTM UAT mutation path.
 //
 
 import Foundation
 import Metal
 
-// MARK: - build gate
-
 enum BuildGate {
     enum Verdict {
         case vulnerable(String), fixed(String), unknown(String)
-
         var text: String {
             switch self {
             case .vulnerable(let b): return "build \(b) — SPTM pre-fix, bug present"
@@ -48,7 +37,6 @@ enum BuildGate {
             }
         }
     }
-
     static var osBuild: String {
         var len = 0
         guard sysctlbyname("kern.osversion", nil, &len, nil, 0) == 0, len > 0 else { return "?" }
@@ -56,7 +44,6 @@ enum BuildGate {
         guard sysctlbyname("kern.osversion", &buf, &len, nil, 0) == 0 else { return "?" }
         return String(cString: buf)
     }
-
     static var verdict: Verdict {
         let b = osBuild
         switch b {
@@ -66,23 +53,32 @@ enum BuildGate {
         }
         if b.hasPrefix("24A") { return .vulnerable(b) }
         if b.hasPrefix("24B5") {
-            let digits = b.dropFirst(3).prefix(while: { $0.isNumber })
-            if let n = Int(digits) { return n >= 5099 ? .fixed(b) : .vulnerable(b) }
+            let d = b.dropFirst(3).prefix(while: { $0.isNumber })
+            if let n = Int(d) { return n >= 5099 ? .fixed(b) : .vulnerable(b) }
         }
         return .unknown(b)
     }
 }
 
-// MARK: - detector
+enum Strategy: String, CaseIterable, Identifiable {
+    case fragment, purge, recycle
+    var id: String { rawValue }
+    var note: String {
+        switch self {
+        case .fragment: return "alternating frees in a contiguous window — targets un-ganging"
+        case .purge:    return "purge/thief/unpurge on a stable VA — no reuse lottery"
+        case .recycle:  return "random slot recycle — baseline"
+        }
+    }
+}
 
 final class Detector: ObservableObject {
 
     // ---- tuning ----
-    private let slots         = 256
-    private let bytes         = 16 * 1024     // one arm64 page
-    private let recycleBatch  = 8
-    private let burst         = 64
-    private let burstEvery    = 32
+    private let slots        = 256
+    private let bytes        = 16 * 1024
+    private let window       = 64                 // contiguous window for fragment
+    private let arenaBytes   = 256 * 1024 * 1024  // held, to get past any heap
     private let controlRounds = 300
     private let publishEvery  = 0.1
 
@@ -90,11 +86,9 @@ final class Detector: ObservableObject {
     private let poolTag:  UInt32 = 0xA5A5_0000
     private let burstTag: UInt32 = 0xB6B6_0000
 
-    enum Kind: String {
-        case vacated     = "write did not land"
-        case stale       = "stale pattern"
-        case unexplained = "unexplained"
-    }
+    enum Kind: String { case vacated = "write did not land"
+                        case stale = "stale pattern"
+                        case unexplained = "unexplained" }
 
     struct Counts { var vacated = 0; var stale = 0; var unexplained = 0
                     var total: Int { vacated + stale + unexplained } }
@@ -104,7 +98,8 @@ final class Detector: ObservableObject {
         var vaReuses    = 0
         var vaLo: UInt64 = 0
         var vaHi: UInt64 = 0
-        var maxMillis   = 0.0
+        var arenaMiB    = 0
+        var gpuBytes: UInt64 = 0
         var rangeMiB: Double { vaLo == 0 ? 0 : Double(vaHi &- vaLo) / 1_048_576 }
     }
 
@@ -117,11 +112,13 @@ final class Detector: ObservableObject {
     @Published private(set) var verdict = BuildGate.verdict
     @Published private(set) var selfTest: [String] = []
     @Published private(set) var vaProbeAvailable = false
+    @Published var strategy: Strategy = .fragment
 
     private var dev: MTLDevice?
     private var queue: MTLCommandQueue?
     private var pipe: MTLComputePipelineState?
     private var pool = [MTLBuffer?]()
+    private var arena: [MTLBuffer] = []
     private var freedVAs = Set<UInt64>()
     private var stopFlag = false
     private var roundCounter = 0
@@ -141,14 +138,12 @@ final class Detector: ObservableObject {
 
     init() {
         if #available(iOS 18.0, *) { vaProbeAvailable = true }
-
         guard let d = MTLCreateSystemDefaultDevice(),
               let cq = d.makeCommandQueue(),
               let lib = try? d.makeLibrary(source: Self.shader, options: nil),
               let fn = lib.makeFunction(name: "stamp"),
               let p = try? d.makeComputePipelineState(function: fn)
         else { return }
-
         dev = d; queue = cq; pipe = p
         pool = [MTLBuffer?](repeating: nil, count: slots)
         ready = true
@@ -156,29 +151,19 @@ final class Detector: ObservableObject {
 
     func start() {
         guard ready, !running else { return }
-        running = true
-        stopFlag = false
+        running = true; stopFlag = false
         work.async { [weak self] in self?.loop() }
     }
-
     func stop() { stopFlag = true }
 
-    // MARK: headline
-
     var headline: String {
-        if !vaProbeAvailable {
-            return "VA reuse unmeasurable on this OS — premise cannot be probed"
-        }
-        if counts.total > 0 {
-            return "\(counts.total) anomalies — a foreign GPU write was observed"
-        }
+        if !vaProbeAvailable { return "VA reuse unmeasurable on this OS — premise cannot be probed" }
+        if counts.total > 0 { return "\(counts.total) anomalies — a foreign GPU write was observed" }
         if probe.vaReuses == 0 {
             return "0 anomalies, 0 VA reuses — uninformative, the detector could not fire"
         }
         return "0 anomalies across \(probe.vaReuses) VA reuses — no hit; premise still unestablished"
     }
-
-    // MARK: address probe
 
     @inline(__always)
     private func va(_ b: MTLBuffer?) -> UInt64? {
@@ -194,21 +179,31 @@ final class Detector: ObservableObject {
 
         runSelfTest(dev: dev, queue: queue, pipe: pipe)
 
+        // Grow: hold a large arena so the pool lands past any pre-mapped region.
+        publish(phase: "grow (\(arenaBytes >> 20) MiB held)")
+        let chunk = 4 * 1024 * 1024
+        while arena.count * chunk < arenaBytes {
+            if let b = dev.makeBuffer(length: chunk, options: .storageModePrivate) {
+                arena.append(b)
+            } else { break }
+            if stopFlag { break }
+            let mib = (arena.count * chunk) >> 20
+            DispatchQueue.main.async { [weak self] in self?.probe.arenaMiB = mib }
+        }
+
         for i in 0..<slots {
             pool[i] = dev.makeBuffer(length: bytes, options: .storageModeShared)
             if let b = pool[i] { fill(b, with: sentinel) }
             note(va(pool[i]))
         }
 
-        // Control: no churn at all, including no burst. Every buffer keeps its
-        // VA and its mapping, so an anomaly here is the checker or the GPU.
         publish(phase: "control (no churn)")
         for _ in 0..<controlRounds {
             if stopFlag { break }
             _ = cycle(churn: false, dev: dev, queue: queue, pipe: pipe)
         }
 
-        publish(phase: "churn")
+        publish(phase: "churn — \(strategy.rawValue)")
         while !stopFlag {
             _ = cycle(churn: true, dev: dev, queue: queue, pipe: pipe)
         }
@@ -217,9 +212,6 @@ final class Detector: ObservableObject {
 
     // MARK: positive control
 
-    /// Deliberately produce both anomaly classes through the real GPU path and
-    /// the real classifier, so a later zero means "the bug did not fire"
-    /// rather than "the detector does not work".
     private func runSelfTest(dev: MTLDevice, queue: MTLCommandQueue, pipe: MTLComputePipelineState) {
         var out: [String] = []
         defer { let s = out; DispatchQueue.main.async { self.selfTest = s } }
@@ -231,45 +223,40 @@ final class Detector: ObservableObject {
         let tagA = poolTag | (0x10 << 8) | 0x01
         let tagB = poolTag | (0x11 << 8) | 0x02
 
-        // 1. honest stamp: both must verify clean
         fill(a, with: sentinel); fill(b, with: sentinel)
         stamp([(a, tagA), (b, tagB)], dev: dev, queue: queue, pipe: pipe)
         out.append(classify(a, want: tagA) == nil ? "PASS  clean stamp (a)" : "FAIL  clean stamp (a)")
         out.append(classify(b, want: tagB) == nil ? "PASS  clean stamp (b)" : "FAIL  clean stamp (b)")
 
-        // 2. foreign: stamp a's VA with b's value. Must classify .stale and
-        //    decode slot 0x11.
         stamp([(a, tagB)], dev: dev, queue: queue, pipe: pipe)
-        let f = classify(a, want: tagA)
-        if f == .stale, let g = firstWord(a), (g >> 8) & 0xFF == 0x11 {
+        if classify(a, want: tagA) == .stale, let g = firstWord(a), (g >> 8) & 0xFF == 0x11 {
             out.append("PASS  foreign write detected, source slot decoded")
-        } else {
-            out.append("FAIL  foreign write — got \(f?.rawValue ?? "clean")")
-        }
+        } else { out.append("FAIL  foreign write") }
 
-        // 3. vacated: CPU clobber b with the sentinel after a valid stamp.
         stamp([(a, tagA), (b, tagB)], dev: dev, queue: queue, pipe: pipe)
         fill(b, with: sentinel)
-        out.append(classify(b, want: tagB) == .vacated
-                   ? "PASS  vacated write detected" : "FAIL  vacated write")
+        out.append(classify(b, want: tagB) == .vacated ? "PASS  vacated write detected"
+                                                       : "FAIL  vacated write")
     }
 
-    // MARK: one round
+    // MARK: round
 
     @discardableResult
     private func cycle(churn: Bool, dev: MTLDevice, queue: MTLCommandQueue,
                        pipe: MTLComputePipelineState) -> Int {
-        let t0 = CFAbsoluteTimeGetCurrent()
         roundCounter &+= 1
         let round = roundCounter
 
         var fresh: [Int] = []
         if churn {
-            fresh = recycleSlots(dev)
+            switch strategy {
+            case .fragment: fresh = fragmentChurn(dev)
+            case .purge:    fresh = purgeChurn(dev, queue: queue, pipe: pipe)
+            case .recycle:  fresh = recycleSlots(dev)
+            }
             for i in fresh { if let b = pool[i] { fill(b, with: sentinel) } }
         }
 
-        // Fresh slots first, so map -> GPU touch has nothing in between.
         let order = fresh + (0..<slots).filter { !fresh.contains($0) }
         var items: [(MTLBuffer, UInt32)] = []
         for i in order {
@@ -280,57 +267,59 @@ final class Detector: ObservableObject {
         var bad = 0
         for i in order {
             guard let b = pool[i] else { continue }
-            let want = expected(slot: i, round: round)
-            guard let kind = classify(b, want: want) else { continue }
+            guard let kind = classify(b, want: expected(slot: i, round: round)) else { continue }
             bad += 1
             record(kind, slot: i, round: round, got: firstWord(b) ?? 0)
         }
-
-        // Burst only in the churn phase, and only once the tight window is
-        // closed by the verify above.
-        if churn && round % burstEvery == 0 {
-            burstChurn(dev: dev, queue: queue, pipe: pipe)
-        }
-
-        wProbe.maxMillis = max(wProbe.maxMillis, (CFAbsoluteTimeGetCurrent() - t0) * 1000)
         maybePublish()
         return bad
     }
 
-    // MARK: churn
+    // MARK: churn strategies
 
-    private func recycleSlots(_ dev: MTLDevice) -> [Int] {
+    /// Alternating frees inside a contiguous window. A whole-window unmap gets
+    /// ganged into one TLBI; freeing every other slot forces partial,
+    /// unaligned unmaps -- the un-ganged shape.
+    private func fragmentChurn(_ dev: MTLDevice) -> [Int] {
+        let base = Int.random(in: 0...(slots - window))
         var fresh: [Int] = []
-        for _ in 0..<recycleBatch {
-            let i = Int.random(in: 0..<slots)
-            if let old = va(pool[i]) {
-                if freedVAs.count > 8192 { freedVAs.removeAll() }
-                freedVAs.insert(old)
-            }
-            pool[i] = nil                                    // release -> unmap
-            pool[i] = dev.makeBuffer(length: bytes, options: .storageModeShared)
-            if let v = va(pool[i]), freedVAs.contains(v) { wProbe.vaReuses += 1 }
-            note(va(pool[i]))
-            fresh.append(i)
+        for k in stride(from: 0, to: window, by: 2) {
+            fresh.append(replace(base + k, dev))
         }
         return fresh
     }
 
-    /// Touch before drop: an untouched buffer has no cached translation, so
-    /// dropping it cannot strand one.
-    private func burstChurn(dev: MTLDevice, queue: MTLCommandQueue, pipe: MTLComputePipelineState) {
-        autoreleasepool {
-            var b: [MTLBuffer] = []
-            b.reserveCapacity(burst)
-            for _ in 0..<burst {
-                if let x = dev.makeBuffer(length: bytes, options: .storageModePrivate) { b.append(x) }
-            }
-            guard !b.isEmpty else { return }
-            var items: [(MTLBuffer, UInt32)] = []
-            for (k, x) in b.enumerated() { items.append((x, burstTag | UInt32(k & 0xFF))) }
-            stamp(items, dev: dev, queue: queue, pipe: pipe)
-            b.removeAll()                                    // unmap
+    /// Purge a slot's backing, let a thief take the pages, then unpurge. The VA
+    /// never moves, so any staleness is directly observable.
+    private func purgeChurn(_ dev: MTLDevice, queue: MTLCommandQueue,
+                            pipe: MTLComputePipelineState) -> [Int] {
+        let i = Int.random(in: 0..<slots)
+        guard let victim = pool[i] else { return [] }
+
+        _ = victim.setPurgeableState(.empty)
+
+        if let thief = dev.makeBuffer(length: bytes, options: .storageModeShared) {
+            stamp([(thief, burstTag | 0x77)], dev: dev, queue: queue, pipe: pipe)
         }
+
+        _ = victim.setPurgeableState(.nonVolatile)
+        return [i]
+    }
+
+    private func recycleSlots(_ dev: MTLDevice) -> [Int] {
+        (0..<8).map { _ in replace(Int.random(in: 0..<slots), dev) }
+    }
+
+    private func replace(_ i: Int, _ dev: MTLDevice) -> Int {
+        if let old = va(pool[i]) {
+            if freedVAs.count > 8192 { freedVAs.removeAll() }
+            freedVAs.insert(old)
+        }
+        pool[i] = nil
+        pool[i] = dev.makeBuffer(length: bytes, options: .storageModeShared)
+        if let v = va(pool[i]), freedVAs.contains(v) { wProbe.vaReuses += 1 }
+        note(va(pool[i]))
+        return i
     }
 
     // MARK: primitives
@@ -347,12 +336,9 @@ final class Detector: ObservableObject {
             enc.dispatchThreads(MTLSize(width: bytes / 4, height: 1, depth: 1),
                                 threadsPerThreadgroup: MTLSize(width: 128, height: 1, depth: 1))
         }
-        enc.endEncoding()
-        cb.commit()
-        cb.waitUntilCompleted()
+        enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()
     }
 
-    /// The single classifier, shared by the self-test and the live loop.
     private func classify(_ b: MTLBuffer, want: UInt32) -> Kind? {
         let n = b.length / MemoryLayout<UInt32>.size
         let p = b.contents().bindMemory(to: UInt32.self, capacity: n)
@@ -386,16 +372,13 @@ final class Detector: ObservableObject {
 
     private func record(_ kind: Kind, slot: Int, round: Int, got: UInt32) {
         switch kind {
-        case .vacated:     wCounts.vacated += 1
-        case .stale:       wCounts.stale += 1
+        case .vacated: wCounts.vacated += 1
+        case .stale:   wCounts.stale += 1
         case .unexplained: wCounts.unexplained += 1
         }
-        let line: String
-        if kind == .stale {
-            line = "r\(round) slot \(slot): holds slot \((got >> 8) & 0xFF) — foreign write"
-        } else {
-            line = "r\(round) slot \(slot): \(kind.rawValue) (\(String(got, radix: 16)))"
-        }
+        let line = kind == .stale
+            ? "r\(round) slot \(slot): holds slot \((got >> 8) & 0xFF) — foreign write"
+            : "r\(round) slot \(slot): \(kind.rawValue) (\(String(got, radix: 16)))"
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             self.recent.insert(line, at: 0)
@@ -407,6 +390,7 @@ final class Detector: ObservableObject {
         let now = CFAbsoluteTimeGetCurrent()
         guard now - lastPublish > publishEvery else { return }
         lastPublish = now
+        if let d = dev { wProbe.gpuBytes = UInt64(d.currentAllocatedSize) }
         let c = wCounts, p = wProbe
         DispatchQueue.main.async { [weak self] in self?.counts = c; self?.probe = p }
     }
@@ -415,9 +399,7 @@ final class Detector: ObservableObject {
         let c = wCounts, pr = wProbe
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
-            self.phase = p
-            self.counts = c
-            self.probe = pr
+            self.phase = p; self.counts = c; self.probe = pr
             if done { self.running = false }
         }
     }
